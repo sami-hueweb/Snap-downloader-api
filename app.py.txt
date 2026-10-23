@@ -1,0 +1,190 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import yt_dlp
+import requests
+import os
+import re
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+def get_best_mp4(info):
+    # Handle playlist
+    if 'entries' in info and info['entries']:
+        # filter None
+        entries = [e for e in info['entries'] if e]
+        if entries:
+            info = entries[0]
+    formats = info.get('formats', [])
+    best = None
+    if formats:
+        mp4s = [f for f in formats if f.get('ext') == 'mp4' and f.get('url')]
+        if mp4s:
+            # sort by height
+            mp4s_sorted = sorted(mp4s, key=lambda x: x.get('height') or 0)
+            best = mp4s_sorted[-1]['url']
+        else:
+            best = formats[-1].get('url')
+    else:
+        best = info.get('url')
+    return best, info, formats
+
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "All-in-One Downloader API - Running",
+        "platforms": {
+            "tiktok": "/api/tiktok?url=...",
+            "twitter": "/api/twitter?url=...",
+            "snapchat": "/api/snapchat?url=...",
+            "instagram": "/api/instagram?url=...",
+            "facebook": "/api/facebook?url=..."
+        },
+        "usage": "GET /api/<platform>?url=SOCIAL_URL",
+        "example": "/api/tiktok?url=https://www.tiktok.com/@user/video/123"
+    })
+
+@app.route('/api/<platform>')
+def download_api(platform):
+    url = request.args.get('url')
+    if not url:
+        return jsonify({"error": "ضع رابط ?url="}), 400
+
+    platform = platform.lower()
+    
+    # TikTok - Use tikwm first (no watermark, better)
+    if platform == 'tiktok':
+        try:
+            r = requests.get(f'https://www.tikwm.com/api/?url={url}', timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+            data = r.json()
+            if data.get('code') == 0 and data.get('data'):
+                d = data['data']
+                # Check if images (photo mode)
+                if d.get('images'):
+                    return jsonify({
+                        "platform": "tiktok",
+                        "type": "images",
+                        "title": d.get('title',''),
+                        "author": d.get('author',{}).get('unique_id',''),
+                        "thumbnail": d.get('cover',''),
+                        "images": d.get('images',[]),
+                        "music_url": d.get('music','')
+                    })
+                return jsonify({
+                    "platform": "tiktok",
+                    "type": "video",
+                    "title": d.get('title',''),
+                    "author": d.get('author',{}).get('unique_id',''),
+                    "thumbnail": d.get('cover','') or d.get('origin_cover',''),
+                    "video_url": d.get('play',''),  # no watermark
+                    "hd_url": d.get('hdplay',''),
+                    "music_url": d.get('music',''),
+                    "duration": d.get('duration',0)
+                })
+        except Exception as e:
+            print(f"Tikwm error: {e}")
+        # Fallback to yt-dlp
+
+    # Twitter - Use vxtwitter first (fast, no auth)
+    if platform == 'twitter' or platform == 'x':
+        try:
+            # Convert x.com/twitter.com to api.vxtwitter.com
+            api_url = url.replace('https://x.com', 'https://api.vxtwitter.com').replace('https://twitter.com', 'https://api.vxtwitter.com').replace('https://www.x.com', 'https://api.vxtwitter.com').replace('http://x.com','https://api.vxtwitter.com')
+            # Handle broadcasts
+            if '/i/broadcasts/' in url or '/i/spaces/' in url:
+                api_url = api_url.replace('api.vxtwitter.com/i/broadcasts', 'api.vxtwitter.com/i/broadcasts').replace('api.vxtwitter.com/i/spaces','api.vxtwitter.com/i/spaces')
+            r = requests.get(api_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code == 200:
+                j = r.json()
+                # media_extended contains videos
+                media_list = j.get('media_extended', [])
+                videos = []
+                for m in media_list:
+                    if m.get('type') in ['video','gif','image']:
+                        if m.get('url'):
+                            videos.append({
+                                "url": m.get('url'),
+                                "type": m.get('type'),
+                                "thumbnail": m.get('thumbnail_url',''),
+                                "width": m.get('width'),
+                                "height": m.get('height')
+                            })
+                        # For video, check variants
+                        if m.get('type') == 'video' and m.get('variants'):
+                            # best quality
+                            best = sorted([v for v in m.get('variants',[]) if v.get('url')], key=lambda x: x.get('bitrate',0))[-1] if m.get('variants') else None
+                            if best:
+                                videos.append({"url": best['url'], "type": "video", "thumbnail": m.get('thumbnail_url','')})
+                if videos:
+                    return jsonify({
+                        "platform": "twitter",
+                        "type": "video" if len(videos)==1 else "playlist",
+                        "title": j.get('text','')[:200],
+                        "author": j.get('user_name','') or j.get('user_screen_name',''),
+                        "thumbnail": j.get('media',{}).get('thumbnail_url','') or (videos[0].get('thumbnail') if videos else ''),
+                        "videos": videos,
+                        "video_url": videos[0]['url'] if videos else ''
+                    })
+        except Exception as e:
+            print(f"VxTwitter error: {e}")
+        # Fallback to yt-dlp
+
+    # Generic yt-dlp for all platforms (Snapchat, Instagram, Facebook + fallback)
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'noplaylist': False,
+            'extractor_args': {'generic': {'impersonate': ['chrome']}}
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            # Handle playlist (carousel, multiple stories)
+            if 'entries' in info:
+                entries = [e for e in info['entries'] if e][:15]
+                videos = []
+                for e in entries:
+                    v_url, _, _ = get_best_mp4(e)
+                    if v_url:
+                        videos.append({
+                            "title": e.get('title',''),
+                            "thumbnail": e.get('thumbnail',''),
+                            "video_url": v_url,
+                            "duration": e.get('duration')
+                        })
+                return jsonify({
+                    "platform": platform,
+                    "type": "playlist",
+                    "count": len(videos),
+                    "videos": videos
+                })
+            else:
+                v_url, info_parsed, formats = get_best_mp4(info)
+                # Build formats list
+                fmt_list = []
+                for f in formats:
+                    if f.get('ext') == 'mp4' and f.get('url'):
+                        fmt_list.append({"height": f.get('height'), "url": f.get('url'), "ext": "mp4"})
+                fmt_list = sorted(fmt_list, key=lambda x: x.get('height') or 0, reverse=True)[:4]
+                
+                return jsonify({
+                    "platform": platform,
+                    "type": "single",
+                    "title": info_parsed.get('title','Video'),
+                    "author": info_parsed.get('uploader','') or info_parsed.get('uploader_id',''),
+                    "thumbnail": info_parsed.get('thumbnail',''),
+                    "video_url": v_url,
+                    "duration": info_parsed.get('duration'),
+                    "formats": fmt_list
+                })
+    except Exception as e:
+        return jsonify({"error": str(e), "message": "تأكد أن الرابط عام Public. المحتوى الخاص لا يمكن تحميله"}), 400
+
+@app.route('/api/health')
+def health():
+    return jsonify({"status": "ok"})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
